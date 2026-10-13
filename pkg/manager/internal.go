@@ -374,13 +374,9 @@ func (cm *controllerManager) Start(ctx context.Context) (err error) {
 		}
 	}
 
-	// This chan indicates that stop is complete, in other words all runnables have returned or timeout on stop request
-	stopComplete := make(chan struct{})
-	defer close(stopComplete)
-	// This must be deferred after closing stopComplete, otherwise we deadlock.
 	defer func() {
 		// https://hips.hearstapps.com/hmg-prod.s3.amazonaws.com/images/gettyimages-459889618-1533579787.jpg
-		stopErr := cm.engageStopProcedure(stopComplete)
+		stopErr := cm.engageStopProcedure()
 		if stopErr != nil {
 			if err != nil {
 				// Utilerrors.Aggregate allows to use errors.Is for all contained errors
@@ -500,7 +496,7 @@ func (cm *controllerManager) Start(ctx context.Context) (err error) {
 
 // engageStopProcedure signals all runnables to stop, reads potential errors
 // from the errChan and waits for them to end. It must not be called more than once.
-func (cm *controllerManager) engageStopProcedure(stopComplete <-chan struct{}) error {
+func (cm *controllerManager) engageStopProcedure() error {
 	if !atomic.CompareAndSwapInt64(cm.stopProcedureEngaged, 0, 1) {
 		return errors.New("stop procedure already engaged")
 	}
@@ -522,7 +518,18 @@ func (cm *controllerManager) engageStopProcedure(stopComplete <-chan struct{}) e
 	// if something that has the lock is blocked on trying to write into the unbuffered
 	// channel after something else already wrote into it.
 	var closeOnce sync.Once
+	// drainStop is closed once everything that may write to errChan has stopped.
+	// We wait for the drain goroutine to exit before returning, so that nothing
+	// (e.g. logging) happens after Start returns.
+	drainStop := make(chan struct{})
+	drainDone := make(chan struct{})
+	// This is deferred first so that it runs last, after leader election has stopped.
+	defer func() {
+		close(drainStop)
+		<-drainDone
+	}()
 	go func() {
+		defer close(drainDone)
 		for {
 			// Closing in the for loop is required to avoid race conditions between
 			// the closure of all internal procedures and making sure to have a reader off the error channel.
@@ -536,7 +543,7 @@ func (cm *controllerManager) engageStopProcedure(stopComplete <-chan struct{}) e
 				if !errors.Is(err, context.Canceled) {
 					cm.logger.Error(err, "error received after stop sequence was engaged")
 				}
-			case <-stopComplete:
+			case <-drainStop:
 				return
 			}
 		}

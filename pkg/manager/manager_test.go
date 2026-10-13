@@ -253,6 +253,47 @@ var _ = Describe("manger.Manager", func() {
 				Expect(cm.gracefulShutdownTimeout.Nanoseconds()).To(Equal(int64(0)))
 			})
 
+			It("should not log after Start returns", func(specCtx SpecContext) {
+				var log struct {
+					sync.Mutex
+					messages []string
+				}
+				m, err := New(cfg, Options{
+					LeaderElection:          true,
+					LeaderElectionNamespace: "default",
+					LeaderElectionID:        "test-leader-election-id-no-log-after-start",
+					HealthProbeBindAddress:  "0",
+					Metrics:                 metricsserver.Options{BindAddress: "0"},
+					PprofBindAddress:        "0",
+					Logger: funcr.NewJSON(func(object string) {
+						log.Lock()
+						log.messages = append(log.messages, object)
+						log.Unlock()
+					}, funcr.Options{}),
+				})
+				Expect(err).NotTo(HaveOccurred())
+				cm := m.(*controllerManager)
+
+				ctx, cancel := context.WithCancel(specCtx)
+				stopped := make(chan error)
+				go func() {
+					stopped <- m.Start(ctx)
+				}()
+				<-cm.Elected()
+				cancel()
+				Expect(<-stopped).To(Succeed())
+
+				log.Lock()
+				numMessages := len(log.messages)
+				log.Unlock()
+
+				Consistently(func() int {
+					log.Lock()
+					defer log.Unlock()
+					return len(log.messages)
+				}, 500*time.Millisecond).Should(Equal(numMessages))
+			})
+
 			It("should prevent leader election when shutting down a non-elected manager", func(specCtx SpecContext) {
 				var rl resourcelock.Interface
 				m1, err := New(cfg, Options{
